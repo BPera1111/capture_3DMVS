@@ -1,0 +1,6 @@
+__pycache__/
+Mv3dLpLog/
+output/
+server_log.txt
+*.pyc
+.DS_Store
