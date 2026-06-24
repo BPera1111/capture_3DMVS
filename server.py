@@ -95,10 +95,18 @@ def do_capture_image(cam, dev_id, timeout_ms, file_type):
     if ret != 0:
         return None, f'SaveImage failed: 0x{ret:08X}', ret
 
+    actual_path = filepath
+    if not os.path.exists(actual_path):
+        recent = [os.path.join(OUTPUT_DIR, f) for f in os.listdir(OUTPUT_DIR)
+                  if os.path.isfile(os.path.join(OUTPUT_DIR, f))]
+        if recent:
+            actual_path = max(recent, key=os.path.getmtime)
+            filename = os.path.basename(actual_path)
+
     result = {
         'filename': filename,
-        'filepath': filepath,
-        'file_size': os.path.getsize(filepath),
+        'filepath': actual_path,
+        'file_size': os.path.getsize(actual_path),
         'frame_num': stImageData.nFrameNum,
         'width': stImageData.nWidth,
         'height': stImageData.nHeight,
@@ -329,10 +337,18 @@ def handle_command(conn, cmd):
             if auto_stop:
                 cam.MV3D_LP_StopMeasure()
 
+            actual_path = filepath
+            if not os.path.exists(actual_path):
+                recent = [os.path.join(OUTPUT_DIR, f) for f in os.listdir(OUTPUT_DIR)
+                          if os.path.isfile(os.path.join(OUTPUT_DIR, f))]
+                if recent:
+                    actual_path = max(recent, key=os.path.getmtime)
+                    filename = os.path.basename(actual_path)
+
             result = {
                 'filename': filename,
-                'filepath': filepath,
-                'file_size': os.path.getsize(filepath),
+                'filepath': actual_path,
+                'file_size': os.path.getsize(actual_path),
                 'frame_num': stImageData.nFrameNum,
                 'width': stImageData.nWidth,
                 'height': stImageData.nHeight,
@@ -414,13 +430,18 @@ def handle_client(conn, addr):
                 if response.get('_file_transfer'):
                     filepath = response.get('_file_path', '')
                     resp_clean = {k: v for k, v in response.items() if not k.startswith('_')}
-                    send_json_line(conn, resp_clean)
-                    with open(filepath, 'rb') as f:
-                        while True:
-                            chunk = f.read(65536)
-                            if not chunk:
-                                break
-                            conn.sendall(chunk)
+                    if not os.path.exists(filepath):
+                        resp_clean['status'] = 'error'
+                        resp_clean['message'] = f'File disappeared: {filepath}'
+                        send_json_line(conn, resp_clean)
+                    else:
+                        send_json_line(conn, resp_clean)
+                        with open(filepath, 'rb') as f:
+                            while True:
+                                chunk = f.read(65536)
+                                if not chunk:
+                                    break
+                                conn.sendall(chunk)
                 else:
                     send_json_line(conn, response)
     except (ConnectionResetError, ConnectionAbortedError, OSError):
