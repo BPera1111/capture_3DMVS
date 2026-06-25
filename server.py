@@ -237,6 +237,8 @@ def handle_command(conn, cmd):
                         'float_min': stParam.ParamInfo.stFloatParam.fMin if stParam.enParamType == ParamType_Float else None,
                         'float_max': stParam.ParamInfo.stFloatParam.fMax if stParam.enParamType == ParamType_Float else None,
                         'enum_value': stParam.ParamInfo.stEnumParam.nCurValue if stParam.enParamType == ParamType_Enum else None,
+                        'enum_support': (list(stParam.ParamInfo.stEnumParam.nSupportValue[:stParam.ParamInfo.stEnumParam.nSupportedNum])
+                                         if stParam.enParamType == ParamType_Enum else None),
                         'string_value': stParam.ParamInfo.stStringParam.chCurValue.decode('ascii').strip('\x00') if stParam.enParamType == ParamType_String else None,
                     }, 'ret': ret}
                 else:
