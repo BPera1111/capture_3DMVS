@@ -351,6 +351,7 @@ def handle_command(conn, cmd):
             archive = cmd.get('archive', False)         # off por defecto: solo stream desde RAM (fluido, no llena disco)
             image_mode = cmd.get('image_mode', None)   # opcional: forzar ImageMode (enum) antes de medir
             user_set = cmd.get('user_set', None)        # opcional: cargar UserSet antes de medir
+            settle_ms = cmd.get('settle_ms', 8000)      # cierre del barrido: ms sin frames nuevos (> que el brake anti-reflejo)
             with device_lock:
                 cam = devices.get(dev_id)
             if not cam:
@@ -373,58 +374,66 @@ def handle_command(conn, cmd):
             if send_trigger:
                 cam.MV3D_LP_SoftTrigger()
 
-            # Bucle robusto: el perfilometro de linea puede tardar en armar un frame de
-            # profundidad (necesita movimiento/trigger del scan). En vez de UN GetImage que
-            # falla con NODATA (0x80060006) al primer intento, reintentamos hasta agotar el
-            # presupuesto de tiempo y aceptamos el primer frame Depth o PointCloud (mismo
-            # patron que program_union/src/capture.py HikLaserCamera.grab_point_cloud).
+            # ACUMULAR todo el barrido (no greedy). El movimiento del 2do laser tiene un
+            # BRAKE intencional (~3s, para que un laser no le haga reflejo al otro) que parte
+            # el tren de triggers Line0: el SDK cierra un frame CORTO antes del brake y otro
+            # despues. Devolver el primero (greedy) -> nube cortada en Y. Por eso leemos TODOS
+            # los frames 3D y los concatenamos, cerrando cuando el movimiento realmente termina
+            # (sin frames nuevos por 'settle_ms', que debe ser > que el brake) o se agota la
+            # ventana. frame_antes_del_brake + frame_despues = barrido completo.
             deadline = time.time() + max(timeout_ms, 1000) / 1000.0
+            settle = max(settle_ms, 1000) / 1000.0
             stImageData = MV3D_LP_IMAGE_DATA()
+            chunks = []                 # bytes float32 XYZ (12 B/punto) de cada frame 3D
+            n_points = 0
+            last_w = last_h = 0
+            last_frame_num = 0
             last_ret = 0x80060006
-            got = False
+            last_frame_t = None
             while time.time() < deadline:
                 last_ret = cam.MV3D_LP_GetImage(ctypes.pointer(stImageData), 1000)
                 if last_ret != 0:
-                    continue                               # NODATA u otro -> reintentar mientras quede tiempo
-                if stImageData.enImageType in (ImageType_Depth, ImageType_PointCloud):
-                    got = True
-                    break
-                # frame de otro tipo (perfil/intensidad) -> seguir buscando uno 3D
-            if not got:
-                if auto_stop:
-                    cam.MV3D_LP_StopMeasure()
+                    # sin frame este poll: si ya juntamos algo y paso el settle, terminar
+                    if chunks and (time.time() - last_frame_t) >= settle:
+                        break
+                    continue            # NODATA u otro -> seguir mientras quede tiempo
+                if stImageData.enImageType not in (ImageType_Depth, ImageType_PointCloud):
+                    continue            # perfil/intensidad -> ignorar
+                if stImageData.enImageType == ImageType_Depth:
+                    stPointCloudData = MV3D_LP_IMAGE_DATA()
+                    ret = Mv3dLp.MV3D_LP_MapDepthToPointCloud(
+                        ctypes.pointer(stImageData), ctypes.pointer(stPointCloudData))
+                    if ret != 0:
+                        if auto_stop:
+                            cam.MV3D_LP_StopMeasure()
+                        return {'status': 'error', 'message': f'MapDepthToPointCloud: {err_str(ret)}', 'ret': ret}
+                    src = stPointCloudData
+                else:
+                    src = stImageData
+                raw_ptr = ctypes.cast(src.pData, ctypes.POINTER(ctypes.c_ubyte * src.nDataLen))
+                chunks.append(bytes(raw_ptr.contents))
+                n_points += src.nDataLen // 12
+                last_w, last_h = src.nWidth, src.nHeight
+                last_frame_num = stImageData.nFrameNum
+                last_frame_t = time.time()
+
+            if auto_stop:
+                cam.MV3D_LP_StopMeasure()
+
+            if not chunks:
                 return {'status': 'error', 'ret': last_ret,
                         'message': (f'GetImage sin frame 3D en {timeout_ms} ms '
                                     f'(ult. {err_str(last_ret)}). Revisar ImageMode/Trigger y '
                                     f'que el scan tenga movimiento.')}
 
-            if stImageData.enImageType == ImageType_Depth:
-                stPointCloudData = MV3D_LP_IMAGE_DATA()
-                ret = Mv3dLp.MV3D_LP_MapDepthToPointCloud(
-                    ctypes.pointer(stImageData), ctypes.pointer(stPointCloudData))
-                if ret != 0:
-                    if auto_stop:
-                        cam.MV3D_LP_StopMeasure()
-                    return {'status': 'error', 'message': f'MapDepthToPointCloud: {err_str(ret)}', 'ret': ret}
-                save_data = stPointCloudData
-            else:
-                save_data = stImageData
-
-            if auto_stop:
-                cam.MV3D_LP_StopMeasure()
-
-            raw_ptr = ctypes.cast(save_data.pData, ctypes.POINTER(ctypes.c_ubyte * save_data.nDataLen))
-            raw_bytes = bytes(raw_ptr.contents)
-
-            n_points = save_data.nDataLen // 12
             header = f"ply\nformat binary_little_endian 1.0\nelement vertex {n_points}\nproperty float x\nproperty float y\nproperty float z\nend_header\n"
-            ply_bytes = header.encode('ascii') + raw_bytes
+            ply_bytes = header.encode('ascii') + b''.join(chunks)
 
             # La nube se DEVUELVE siempre desde RAM (stream binario). Archivar a disco es
             # OPCIONAL y por defecto OFF: era lento y, sobre todo, llenaba el disco del
             # server (cada nube ~80-270 MB). El cliente que quiera copia pasa archive=true.
             timestamp = time.strftime('%Y%m%d_%H%M%S')
-            filename = f'{dev_id}_pointcloud_{timestamp}_{stImageData.nFrameNum}.ply'
+            filename = f'{dev_id}_pointcloud_{timestamp}_{last_frame_num}.ply'
             filepath = None
             if archive:
                 filepath = os.path.join(OUTPUT_DIR, filename)
@@ -435,10 +444,10 @@ def handle_command(conn, cmd):
                 'filename': filename,
                 'filepath': filepath,
                 'file_size': len(ply_bytes),
-                'frame_num': stImageData.nFrameNum,
-                'width': save_data.nWidth,
-                'height': save_data.nHeight,
-                'image_type': save_data.enImageType,
+                'frame_num': last_frame_num,
+                'n_frames': len(chunks),
+                'width': last_w,
+                'height': last_h,
                 'archived': bool(archive),
             }
             return {
