@@ -84,8 +84,14 @@ class Mv3dLpClient:
     def discover(self):
         return self.send_command({'action': 'discover'})
 
-    def open_by_sn(self, serial):
-        return self.send_command({'action': 'open_by_sn', 'serial': serial})
+    def open_by_sn(self, serial, user_set=None):
+        cmd = {'action': 'open_by_sn', 'serial': serial}
+        if user_set is not None:
+            cmd['user_set'] = user_set
+        return self.send_command(cmd)
+
+    def load_user_set(self, device_id, user_set=1):
+        return self.send_command({'action': 'load_user_set', 'device_id': device_id, 'user_set': user_set})
 
     def open_by_ip(self, ip):
         return self.send_command({'action': 'open_by_ip', 'ip': ip})
@@ -185,8 +191,9 @@ def print_help():
     print("""
 === GESTION DE LASERES ===
   discover                          - Listar todos los lasers
-  open_by_sn <serial>               - Abrir laser por serial
+  open_by_sn <serial> [user_set]    - Abrir laser por serial (opcional: cargar UserSet, 1=UserSet1)
   open_by_ip <ip>                   - Abrir laser por IP
+  userset <device_id> [idx]         - Cargar UserSet (perfil del laser, idx 1 = UserSet1)
   close <device_id>                 - Cerrar laser
   start <device_id>                 - Iniciar medicion
   stop <device_id>                  - Detener medicion
@@ -265,13 +272,25 @@ def main():
 
             elif cmd == 'open_by_sn':
                 if len(args) < 2:
-                    print("Uso: open_by_sn <serial>")
+                    print("Uso: open_by_sn <serial> [user_set]")
                     continue
-                resp = client.open_by_sn(args[1])
+                user_set = int(args[2]) if len(args) > 2 else None
+                resp = client.open_by_sn(args[1], user_set)
                 if resp.get('status') == 'ok':
                     print(f"Laser abierto. Device ID: {resp['device_id']}")
+                    if 'user_set_loaded' in resp:
+                        print(f"  UserSet {resp.get('user_set')}: "
+                              + ("cargado" if resp['user_set_loaded'] else f"FALLO (ret {resp.get('user_set_ret')})"))
                 else:
                     print(f"Error: {resp.get('message', resp)}")
+
+            elif cmd == 'userset':
+                if len(args) < 2:
+                    print("Uso: userset <device_id> [idx]   (idx 1 = UserSet1, perfil del laser)")
+                    continue
+                idx = int(args[2]) if len(args) > 2 else 1
+                resp = client.load_user_set(args[1], idx)
+                print(f"UserSet {idx} cargado." if resp.get('status') == 'ok' else f"Error: {resp.get('message', resp)}")
 
             elif cmd == 'open_by_ip':
                 if len(args) < 2:

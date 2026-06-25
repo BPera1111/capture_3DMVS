@@ -14,7 +14,7 @@ from Mv3dLpImport.Mv3dLpDefine import (
     MV3D_LP_DEVICE_INFO, MV3D_LP_DEVICE_INFO_LIST, MV3D_LP_IP_CONFIG,
     MV3D_LP_PARAM, MV3D_LP_IMAGE_DATA,
     ParamType_Bool, ParamType_Int, ParamType_Float, ParamType_Enum, ParamType_String,
-    ImageType_Depth, ImageType_Profile,
+    ImageType_Depth, ImageType_Profile, ImageType_PointCloud,
     FileType_PLY, FileType_CSV, FileType_OBJ, FileType_BMP, FileType_JPG, FileType_TIFF,
     FileType_PLY_BINARY,
     IpCfgMode_Static, IpCfgMode_DHCP, IpCfgMode_LLA,
@@ -28,6 +28,36 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 clients = {}
 devices = {}
 device_lock = threading.Lock()
+
+# Codigos de error del SDK (Mv3dLpDefine: rango 0x80060000-0x800600FF) -> nombre legible.
+SDK_ERRORS = {
+    0x80060000: 'E_HANDLE', 0x80060001: 'E_SUPPORT', 0x80060002: 'E_BUFOVER',
+    0x80060003: 'E_CALLORDER', 0x80060004: 'E_PARAMETER', 0x80060005: 'E_RESOURCE',
+    0x80060006: 'E_NODATA', 0x80060007: 'E_PRECONDITION', 0x80060008: 'E_VERSION',
+    0x80060009: 'E_NOENOUGH_BUF', 0x8006000A: 'E_ABNORMAL_IMAGE', 0x8006000B: 'E_LOAD_LIBRARY',
+    0x8006000C: 'E_ALGORITHM', 0x8006000D: 'E_DEVICE_OFFLINE', 0x8006000E: 'E_ACCESS_DENIED',
+    0x8006000F: 'E_OUTOFRANGE', 0x800600FF: 'E_UNKNOW',
+}
+
+def err_str(ret):
+    """0xXXXXXXXX (NOMBRE) para los codigos de estado del SDK."""
+    code = ret & 0xFFFFFFFF
+    return f"0x{code:08X} ({SDK_ERRORS.get(code, 'desconocido')})"
+
+def set_enum_param(cam, name, value):
+    """SetParam de un enum (p.ej. ImageMode, UserSetSelector) por valor entero."""
+    stParam = MV3D_LP_PARAM()
+    stParam.enParamType = ParamType_Enum
+    stParam.ParamInfo.stEnumParam.nCurValue = int(value)
+    return cam.MV3D_LP_SetParam(name.encode('ascii'), ctypes.pointer(stParam))
+
+def load_user_set(cam, selector):
+    """Carga un UserSet del sensor: UserSetSelector=<idx> + Execute('UserSetLoad').
+    El usuario configuro el perfil del laser en UserSet1 (idx 1). Devuelve el ret del SDK."""
+    ret = set_enum_param(cam, 'UserSetSelector', selector)
+    if ret != 0:
+        return ret
+    return cam.MV3D_LP_Execute('UserSetLoad'.encode('ascii'))
 
 def device_info_to_dict(info):
     def buf_to_str(buf):
@@ -125,27 +155,41 @@ def handle_command(conn, cmd):
 
         elif action == 'open_by_sn':
             serial = cmd.get('serial', '')
+            user_set = cmd.get('user_set', None)   # opcional: cargar UserSet (1 = UserSet1)
             cam = Mv3dLp()
             ret = cam.MV3D_LP_OpenDeviceBySN(serial.encode('ascii'))
             if ret == 0:
                 dev_id = str(id(cam))
                 with device_lock:
                     devices[dev_id] = cam
-                return {'status': 'ok', 'device_id': dev_id, 'ret': ret}
+                resp = {'status': 'ok', 'device_id': dev_id, 'ret': ret}
+                if user_set is not None:
+                    us = load_user_set(cam, user_set)
+                    resp['user_set'] = user_set
+                    resp['user_set_loaded'] = (us == 0)
+                    resp['user_set_ret'] = us
+                return resp
             else:
-                return {'status': 'error', 'ret': ret}
+                return {'status': 'error', 'ret': ret, 'message': f'OpenDeviceBySN: {err_str(ret)}'}
 
         elif action == 'open_by_ip':
             ip = cmd.get('ip', '')
+            user_set = cmd.get('user_set', None)
             cam = Mv3dLp()
             ret = cam.MV3D_LP_OpenDeviceByIP(ip.encode('ascii'))
             if ret == 0:
                 dev_id = str(id(cam))
                 with device_lock:
                     devices[dev_id] = cam
-                return {'status': 'ok', 'device_id': dev_id, 'ret': ret}
+                resp = {'status': 'ok', 'device_id': dev_id, 'ret': ret}
+                if user_set is not None:
+                    us = load_user_set(cam, user_set)
+                    resp['user_set'] = user_set
+                    resp['user_set_loaded'] = (us == 0)
+                    resp['user_set_ret'] = us
+                return resp
             else:
-                return {'status': 'error', 'ret': ret}
+                return {'status': 'error', 'ret': ret, 'message': f'OpenDeviceByIP: {err_str(ret)}'}
 
         elif action == 'close':
             dev_id = cmd.get('device_id', '')
@@ -244,6 +288,17 @@ def handle_command(conn, cmd):
                 return {'status': 'ok' if ret == 0 else 'error', 'ret': ret}
             return {'status': 'error', 'message': 'Device not found'}
 
+        elif action == 'load_user_set':
+            dev_id = cmd.get('device_id', '')
+            selector = cmd.get('user_set', 1)        # 1 = UserSet1 (perfil del laser)
+            with device_lock:
+                cam = devices.get(dev_id)
+            if cam:
+                ret = load_user_set(cam, selector)
+                return {'status': 'ok' if ret == 0 else 'error', 'ret': ret,
+                        'message': None if ret == 0 else f'UserSetLoad: {err_str(ret)}'}
+            return {'status': 'error', 'message': 'Device not found'}
+
         elif action == 'set_ip':
             serial = cmd.get('serial', '')
             ip_cfg = cmd.get('ip_config', {})
@@ -291,25 +346,54 @@ def handle_command(conn, cmd):
             auto_start = cmd.get('auto_start', True)
             auto_stop = cmd.get('auto_stop', True)
             send_trigger = cmd.get('send_trigger', True)
+            image_mode = cmd.get('image_mode', None)   # opcional: forzar ImageMode (enum) antes de medir
+            user_set = cmd.get('user_set', None)        # opcional: cargar UserSet antes de medir
             with device_lock:
                 cam = devices.get(dev_id)
             if not cam:
                 return {'status': 'error', 'message': 'Device not found'}
 
+            # Config opcional ANTES de medir. Por defecto NO se tocan (se respeta el
+            # UserSet de power-on, p.ej. UserSet1 con el perfil del laser ya configurado).
+            if user_set is not None:
+                load_user_set(cam, user_set)
+            if image_mode is not None:
+                ret = set_enum_param(cam, 'ImageMode', image_mode)
+                if ret != 0:
+                    return {'status': 'error', 'message': f'SetParam(ImageMode): {err_str(ret)}', 'ret': ret}
+
             if auto_start:
                 ret = cam.MV3D_LP_StartMeasure()
                 if ret != 0:
-                    return {'status': 'error', 'message': f'StartMeasure failed: 0x{ret:08X}', 'ret': ret}
+                    return {'status': 'error', 'message': f'StartMeasure: {err_str(ret)}', 'ret': ret}
 
             if send_trigger:
                 cam.MV3D_LP_SoftTrigger()
 
+            # Bucle robusto: el perfilometro de linea puede tardar en armar un frame de
+            # profundidad (necesita movimiento/trigger del scan). En vez de UN GetImage que
+            # falla con NODATA (0x80060006) al primer intento, reintentamos hasta agotar el
+            # presupuesto de tiempo y aceptamos el primer frame Depth o PointCloud (mismo
+            # patron que program_union/src/capture.py HikLaserCamera.grab_point_cloud).
+            deadline = time.time() + max(timeout_ms, 1000) / 1000.0
             stImageData = MV3D_LP_IMAGE_DATA()
-            ret = cam.MV3D_LP_GetImage(ctypes.pointer(stImageData), timeout_ms)
-            if ret != 0:
+            last_ret = 0x80060006
+            got = False
+            while time.time() < deadline:
+                last_ret = cam.MV3D_LP_GetImage(ctypes.pointer(stImageData), 1000)
+                if last_ret != 0:
+                    continue                               # NODATA u otro -> reintentar mientras quede tiempo
+                if stImageData.enImageType in (ImageType_Depth, ImageType_PointCloud):
+                    got = True
+                    break
+                # frame de otro tipo (perfil/intensidad) -> seguir buscando uno 3D
+            if not got:
                 if auto_stop:
                     cam.MV3D_LP_StopMeasure()
-                return {'status': 'error', 'message': f'GetImage failed: 0x{ret:08X}', 'ret': ret}
+                return {'status': 'error', 'ret': last_ret,
+                        'message': (f'GetImage sin frame 3D en {timeout_ms} ms '
+                                    f'(ult. {err_str(last_ret)}). Revisar ImageMode/Trigger y '
+                                    f'que el scan tenga movimiento.')}
 
             if stImageData.enImageType == ImageType_Depth:
                 stPointCloudData = MV3D_LP_IMAGE_DATA()
@@ -318,7 +402,7 @@ def handle_command(conn, cmd):
                 if ret != 0:
                     if auto_stop:
                         cam.MV3D_LP_StopMeasure()
-                    return {'status': 'error', 'message': f'MapDepthToPointCloud failed: 0x{ret:08X}', 'ret': ret}
+                    return {'status': 'error', 'message': f'MapDepthToPointCloud: {err_str(ret)}', 'ret': ret}
                 save_data = stPointCloudData
             else:
                 save_data = stImageData
