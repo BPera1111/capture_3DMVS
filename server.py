@@ -342,10 +342,11 @@ def handle_command(conn, cmd):
 
         elif action == 'capture_pointcloud':
             dev_id = cmd.get('device_id', '')
-            timeout_ms = cmd.get('timeout', 10000)
+            timeout_ms = cmd.get('timeout', 120000)    # el barrido fisico (robots+Line0) es lento (~70s)
             auto_start = cmd.get('auto_start', True)
             auto_stop = cmd.get('auto_stop', True)
             send_trigger = cmd.get('send_trigger', True)
+            archive = cmd.get('archive', False)         # off por defecto: solo stream desde RAM (fluido, no llena disco)
             image_mode = cmd.get('image_mode', None)   # opcional: forzar ImageMode (enum) antes de medir
             user_set = cmd.get('user_set', None)        # opcional: cargar UserSet antes de medir
             with device_lock:
@@ -417,11 +418,16 @@ def handle_command(conn, cmd):
             header = f"ply\nformat binary_little_endian 1.0\nelement vertex {n_points}\nproperty float x\nproperty float y\nproperty float z\nend_header\n"
             ply_bytes = header.encode('ascii') + raw_bytes
 
+            # La nube se DEVUELVE siempre desde RAM (stream binario). Archivar a disco es
+            # OPCIONAL y por defecto OFF: era lento y, sobre todo, llenaba el disco del
+            # server (cada nube ~80-270 MB). El cliente que quiera copia pasa archive=true.
             timestamp = time.strftime('%Y%m%d_%H%M%S')
             filename = f'{dev_id}_pointcloud_{timestamp}_{stImageData.nFrameNum}.ply'
-            filepath = os.path.join(OUTPUT_DIR, filename)
-            with open(filepath, 'wb') as f:
-                f.write(ply_bytes)
+            filepath = None
+            if archive:
+                filepath = os.path.join(OUTPUT_DIR, filename)
+                with open(filepath, 'wb') as f:
+                    f.write(ply_bytes)
 
             result = {
                 'filename': filename,
@@ -431,6 +437,7 @@ def handle_command(conn, cmd):
                 'width': save_data.nWidth,
                 'height': save_data.nHeight,
                 'image_type': save_data.enImageType,
+                'archived': bool(archive),
             }
             return {
                 'status': 'ok',

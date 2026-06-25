@@ -140,7 +140,7 @@ class Mv3dLpClient:
         return self.send_command({'action': 'save_image', 'device_id': device_id, 'timeout': timeout, 'file_type': file_type},
                                  reply_timeout=timeout//1000 + 10)
 
-    def capture_pointcloud(self, device_id, timeout=10000, auto_start=True, auto_stop=True, send_trigger=True, dest_dir='.'):
+    def capture_pointcloud(self, device_id, timeout=120000, auto_start=True, auto_stop=True, send_trigger=True, dest_dir='.'):
         reply_to = timeout//1000 + 15
         self.sock.sendall(json.dumps({
             'action': 'capture_pointcloud',
@@ -424,8 +424,8 @@ def main():
                 if len(args) < 2:
                     print("Uso: capture <device_id> [timeout_ms]")
                     continue
-                timeout = int(args[2]) if len(args) > 2 else 15000
-                print("Capturando nube de puntos (esperando trigger)...")
+                timeout = int(args[2]) if len(args) > 2 else 120000
+                print("Capturando nube de puntos (esperando trigger del scan)...")
                 resp = client.capture_pointcloud(args[1], timeout)
                 if resp.get('status') == 'ok':
                     pc = resp.get('pointcloud', {})
