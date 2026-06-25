@@ -6,7 +6,6 @@ import threading
 import ctypes
 import traceback
 import time
-import struct
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -324,37 +323,37 @@ def handle_command(conn, cmd):
             else:
                 save_data = stImageData
 
-            timestamp = time.strftime('%Y%m%d_%H%M%S')
-            filename = f'{dev_id}_pointcloud_{timestamp}_{stImageData.nFrameNum}.ply'
-            filepath = os.path.join(OUTPUT_DIR, filename)
-
-            ret = Mv3dLp.MV3D_LP_SaveImage(ctypes.pointer(save_data), FileType_PLY, filepath.encode('ascii'))
-            if ret != 0:
-                if auto_stop:
-                    cam.MV3D_LP_StopMeasure()
-                return {'status': 'error', 'message': f'SaveImage failed: 0x{ret:08X}', 'ret': ret}
-
             if auto_stop:
                 cam.MV3D_LP_StopMeasure()
 
-            actual_path = filepath
-            if not os.path.exists(actual_path):
-                recent = [os.path.join(OUTPUT_DIR, f) for f in os.listdir(OUTPUT_DIR)
-                          if os.path.isfile(os.path.join(OUTPUT_DIR, f))]
-                if recent:
-                    actual_path = max(recent, key=os.path.getmtime)
-                    filename = os.path.basename(actual_path)
+            raw_ptr = ctypes.cast(save_data.pData, ctypes.POINTER(ctypes.c_ubyte * save_data.nDataLen))
+            raw_bytes = bytes(raw_ptr.contents)
+
+            n_points = save_data.nDataLen // 12
+            header = f"ply\nformat binary_little_endian 1.0\nelement vertex {n_points}\nproperty float x\nproperty float y\nproperty float z\nend_header\n"
+            ply_bytes = header.encode('ascii') + raw_bytes
+
+            timestamp = time.strftime('%Y%m%d_%H%M%S')
+            filename = f'{dev_id}_pointcloud_{timestamp}_{stImageData.nFrameNum}.ply'
+            filepath = os.path.join(OUTPUT_DIR, filename)
+            with open(filepath, 'wb') as f:
+                f.write(ply_bytes)
 
             result = {
                 'filename': filename,
-                'filepath': actual_path,
-                'file_size': os.path.getsize(actual_path),
+                'filepath': filepath,
+                'file_size': len(ply_bytes),
                 'frame_num': stImageData.nFrameNum,
-                'width': stImageData.nWidth,
-                'height': stImageData.nHeight,
-                'image_type': stImageData.enImageType,
+                'width': save_data.nWidth,
+                'height': save_data.nHeight,
+                'image_type': save_data.enImageType,
             }
-            return {'status': 'ok', 'pointcloud': result}
+            return {
+                'status': 'ok',
+                'pointcloud': result,
+                '_file_transfer': True,
+                '_file_data': ply_bytes,
+            }
 
         elif action == 'save_image':
             dev_id = cmd.get('device_id', '')
@@ -428,20 +427,25 @@ def handle_client(conn, addr):
                     response = {'status': 'error', 'message': f'Invalid JSON: {str(e)}'}
 
                 if response.get('_file_transfer'):
-                    filepath = response.get('_file_path', '')
                     resp_clean = {k: v for k, v in response.items() if not k.startswith('_')}
-                    if not os.path.exists(filepath):
-                        resp_clean['status'] = 'error'
-                        resp_clean['message'] = f'File disappeared: {filepath}'
+                    file_data = response.get('_file_data')
+                    if file_data is not None:
                         send_json_line(conn, resp_clean)
+                        conn.sendall(file_data)
                     else:
-                        send_json_line(conn, resp_clean)
-                        with open(filepath, 'rb') as f:
-                            while True:
-                                chunk = f.read(65536)
-                                if not chunk:
-                                    break
-                                conn.sendall(chunk)
+                        filepath = response.get('_file_path', '')
+                        if not os.path.exists(filepath):
+                            resp_clean['status'] = 'error'
+                            resp_clean['message'] = f'File disappeared: {filepath}'
+                            send_json_line(conn, resp_clean)
+                        else:
+                            send_json_line(conn, resp_clean)
+                            with open(filepath, 'rb') as f:
+                                while True:
+                                    chunk = f.read(65536)
+                                    if not chunk:
+                                        break
+                                    conn.sendall(chunk)
                 else:
                     send_json_line(conn, response)
     except (ConnectionResetError, ConnectionAbortedError, OSError):

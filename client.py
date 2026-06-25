@@ -134,16 +134,49 @@ class Mv3dLpClient:
         return self.send_command({'action': 'save_image', 'device_id': device_id, 'timeout': timeout, 'file_type': file_type},
                                  reply_timeout=timeout//1000 + 10)
 
-    def capture_pointcloud(self, device_id, timeout=10000, auto_start=True, auto_stop=True, send_trigger=True):
+    def capture_pointcloud(self, device_id, timeout=10000, auto_start=True, auto_stop=True, send_trigger=True, dest_dir='.'):
         reply_to = timeout//1000 + 15
-        return self.send_command({
+        self.sock.sendall(json.dumps({
             'action': 'capture_pointcloud',
             'device_id': device_id,
             'timeout': timeout,
             'auto_start': auto_start,
             'auto_stop': auto_stop,
             'send_trigger': send_trigger,
-        }, reply_timeout=reply_to)
+        }).encode() + b'\n')
+        self.sock.settimeout(reply_to)
+        self.buffer = b''
+        try:
+            while True:
+                data = self.sock.recv(65536)
+                if not data:
+                    raise ConnectionError("Connection closed by server")
+                self.buffer += data
+                idx = self.buffer.find(b'\n')
+                if idx != -1:
+                    line = self.buffer[:idx].strip()
+                    resp = json.loads(line.decode('utf-8'))
+                    remaining = self.buffer[idx + 1:]
+                    if resp.get('status') == 'ok' and resp.get('pointcloud'):
+                        pc = resp['pointcloud']
+                        file_size = pc.get('file_size', 0)
+                        filename = pc.get('filename', 'pointcloud.ply')
+                        if file_size > 0:
+                            dest_path = os.path.join(dest_dir, os.path.basename(filename))
+                            with open(dest_path, 'wb') as f:
+                                if remaining:
+                                    f.write(remaining)
+                                    file_size -= len(remaining)
+                                while file_size > 0:
+                                    chunk = self.sock.recv(min(65536, file_size))
+                                    if not chunk:
+                                        raise ConnectionError("Connection closed during file transfer")
+                                    f.write(chunk)
+                                    file_size -= len(chunk)
+                            pc['downloaded_path'] = dest_path
+                    return resp
+        finally:
+            self.sock.settimeout(None)
 
     def list_output(self):
         return self.send_command({'action': 'list_output'})
@@ -380,12 +413,15 @@ def main():
                     print(f"Nube de puntos capturada: {pc.get('filename')}")
                     print(f"  Tamano: {pc.get('file_size')} bytes")
                     print(f"  Frame: {pc.get('frame_num')}")
-                    print("Descargando...")
-                    resp2 = client.download_file(pc.get('filename'))
-                    if resp2.get('status') == 'ok':
-                        print(f"Descargado a: {resp2.get('path')} ({resp2.get('file_size')} bytes)")
+                    if pc.get('downloaded_path'):
+                        print(f"Descargado a: {pc['downloaded_path']} ({pc.get('file_size')} bytes)")
                     else:
-                        print(f"Error descarga: {resp2}")
+                        print("Descargando (legacy)...")
+                        resp2 = client.download_file(pc.get('filename'))
+                        if resp2.get('status') == 'ok':
+                            print(f"Descargado a: {resp2.get('path')} ({resp2.get('file_size')} bytes)")
+                        else:
+                            print(f"Error descarga: {resp2}")
                 else:
                     print(f"Error: {resp.get('message', resp)}")
 
