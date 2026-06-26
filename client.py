@@ -140,7 +140,7 @@ class Mv3dLpClient:
         return self.send_command({'action': 'save_image', 'device_id': device_id, 'timeout': timeout, 'file_type': file_type},
                                  reply_timeout=timeout//1000 + 10)
 
-    def capture_pointcloud(self, device_id, timeout=120000, auto_start=True, auto_stop=True, send_trigger=True, dest_dir='.'):
+    def capture_pointcloud(self, device_id, timeout=120000, auto_start=True, auto_stop=True, send_trigger=False, dest_dir='.'):
         reply_to = timeout//1000 + 15
         self.sock.sendall(json.dumps({
             'action': 'capture_pointcloud',

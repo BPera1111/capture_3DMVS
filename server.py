@@ -347,7 +347,12 @@ def handle_command(conn, cmd):
             timeout_ms = cmd.get('timeout', 120000)    # el barrido fisico (robots+Line0) es lento (~70s)
             auto_start = cmd.get('auto_start', True)
             auto_stop = cmd.get('auto_stop', True)
-            send_trigger = cmd.get('send_trigger', True)
+            # OFF por defecto: con trigger Line0 (hardware) el SoftTrigger NO hace falta y
+            # ADEMAS cambia el modo del laser a software/free-collection (persiste hasta
+            # recargar el UserSet). 3DMVS y nuestro HikLaserCamera tampoco lo usan: solo
+            # StartMeasure -> esperar el frame -> StopMeasure. Solo pasar True si el laser
+            # esta en trigger por SOFTWARE.
+            send_trigger = cmd.get('send_trigger', False)
             archive = cmd.get('archive', False)         # off por defecto: solo stream desde RAM (fluido, no llena disco)
             image_mode = cmd.get('image_mode', None)   # opcional: forzar ImageMode (enum) antes de medir
             user_set = cmd.get('user_set', None)        # opcional: cargar UserSet antes de medir
