@@ -357,6 +357,7 @@ def handle_command(conn, cmd):
             image_mode = cmd.get('image_mode', None)   # opcional: forzar ImageMode (enum) antes de medir
             user_set = cmd.get('user_set', None)        # opcional: cargar UserSet antes de medir
             settle_ms = cmd.get('settle_ms', 8000)      # cierre del barrido: ms sin frames nuevos (> que el brake anti-reflejo)
+            compress = cmd.get('compress', False)        # comprimir el stream (zlib) -> el cliente debe descomprimir (opt-in)
             with device_lock:
                 cam = devices.get(dev_id)
             if not cam:
@@ -431,8 +432,23 @@ def handle_command(conn, cmd):
                                     f'(ult. {err_str(last_ret)}). Revisar ImageMode/Trigger y '
                                     f'que el scan tenga movimiento.')}
 
+            # Filtrar centinelas (0,0,0) y no-finitos EN EL SERVER (si hay numpy) -> baja la
+            # transferencia a la mitad (>50% suelen ser pixeles sin dato). El PLY queda valido
+            # y el cliente filtra lo mismo, asi que el resultado es identico. Sin numpy se manda
+            # el grid completo (igual funciona, solo mas pesado).
+            body = b''.join(chunks)
+            try:
+                import numpy as _np
+                arr = _np.frombuffer(body, dtype='<f4').reshape(-1, 3)
+                m = ~(arr == 0).all(axis=1) & _np.isfinite(arr).all(axis=1)
+                arr = arr[m]
+                body = arr.tobytes()
+                n_points = int(arr.shape[0])
+            except Exception:
+                pass
+
             header = f"ply\nformat binary_little_endian 1.0\nelement vertex {n_points}\nproperty float x\nproperty float y\nproperty float z\nend_header\n"
-            ply_bytes = header.encode('ascii') + b''.join(chunks)
+            ply_bytes = header.encode('ascii') + body
 
             # La nube se DEVUELVE siempre desde RAM (stream binario). Archivar a disco es
             # OPCIONAL y por defecto OFF: era lento y, sobre todo, llenaba el disco del
@@ -443,12 +459,24 @@ def handle_command(conn, cmd):
             if archive:
                 filepath = os.path.join(OUTPUT_DIR, filename)
                 with open(filepath, 'wb') as f:
-                    f.write(ply_bytes)
+                    f.write(ply_bytes)        # archivo: PLY normal sin comprimir
+
+            # Transferencia: comprimir (zlib-1) solo si el cliente lo pidio (opt-in -> no rompe
+            # clientes viejos). El cliente lee 'encoding' y descomprime.
+            payload = ply_bytes
+            encoding = None
+            if compress:
+                import zlib
+                payload = zlib.compress(ply_bytes, 1)
+                encoding = 'zlib'
 
             result = {
                 'filename': filename,
                 'filepath': filepath,
-                'file_size': len(ply_bytes),
+                'file_size': len(payload),       # bytes que viajan (comprimidos si encoding)
+                'uncompressed_size': len(ply_bytes),
+                'encoding': encoding,
+                'n_points': n_points,
                 'frame_num': last_frame_num,
                 'n_frames': len(chunks),
                 'width': last_w,
@@ -459,7 +487,7 @@ def handle_command(conn, cmd):
                 'status': 'ok',
                 'pointcloud': result,
                 '_file_transfer': True,
-                '_file_data': ply_bytes,
+                '_file_data': payload,
             }
 
         elif action == 'save_image':
