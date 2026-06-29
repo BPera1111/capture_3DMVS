@@ -358,6 +358,7 @@ def handle_command(conn, cmd):
             user_set = cmd.get('user_set', None)        # opcional: cargar UserSet antes de medir
             settle_ms = cmd.get('settle_ms', 8000)      # cierre del barrido: ms sin frames nuevos (> que el brake anti-reflejo)
             compress = cmd.get('compress', False)        # comprimir el stream (zlib) -> el cliente debe descomprimir (opt-in)
+            with_intensity = cmd.get('with_intensity', False)  # adjuntar intensidad del laser (R=G=B) -> PLY texturizado (opt-in)
             with device_lock:
                 cam = devices.get(dev_id)
             if not cam:
@@ -391,6 +392,8 @@ def handle_command(conn, cmd):
             settle = max(settle_ms, 1000) / 1000.0
             stImageData = MV3D_LP_IMAGE_DATA()
             chunks = []                 # bytes float32 XYZ (12 B/punto) de cada frame 3D
+            int_chunks = []             # bytes de intensidad (1 B/punto, Mono8) por frame, alineados con chunks
+            int_ok = with_intensity     # se apaga si algun frame no trae intensidad alineada
             n_points = 0
             last_w = last_h = 0
             last_frame_num = 0
@@ -418,7 +421,19 @@ def handle_command(conn, cmd):
                     src = stImageData
                 raw_ptr = ctypes.cast(src.pData, ctypes.POINTER(ctypes.c_ubyte * src.nDataLen))
                 chunks.append(bytes(raw_ptr.contents))
-                n_points += src.nDataLen // 12
+                pts_this = src.nDataLen // 12
+                n_points += pts_this
+                # Intensidad (efecto metal): viaja en el frame ORIGINAL (stImageData.pIntensityData),
+                # 1 byte/punto (Mono8) alineada con los puntos. Solo si el cliente la pidio y el
+                # frame la trae con el largo justo; si no calza, se descarta toda la intensidad.
+                if int_ok:
+                    n_int = int(stImageData.nIntensityDataLen)
+                    if stImageData.pIntensityData and n_int == pts_this:
+                        ip = ctypes.cast(stImageData.pIntensityData,
+                                         ctypes.POINTER(ctypes.c_ubyte * n_int))
+                        int_chunks.append(bytes(ip.contents))
+                    else:
+                        int_ok = False     # frame sin intensidad alineada -> no se puede texturizar
                 last_w, last_h = src.nWidth, src.nHeight
                 last_frame_num = stImageData.nFrameNum
                 last_frame_t = time.time()
@@ -437,17 +452,40 @@ def handle_command(conn, cmd):
             # y el cliente filtra lo mismo, asi que el resultado es identico. Sin numpy se manda
             # el grid completo (igual funciona, solo mas pesado).
             body = b''.join(chunks)
+            inten_bytes = b''.join(int_chunks) if int_ok else b''
+            textured = False
             try:
                 import numpy as _np
                 arr = _np.frombuffer(body, dtype='<f4').reshape(-1, 3)
                 m = ~(arr == 0).all(axis=1) & _np.isfinite(arr).all(axis=1)
+                # Intensidad: solo si juntamos un byte por punto del grid completo (mismo orden).
+                inten = None
+                if int_ok and len(inten_bytes) == arr.shape[0]:
+                    inten = _np.frombuffer(inten_bytes, dtype=_np.uint8)[m]
                 arr = arr[m]
-                body = arr.tobytes()
+                if inten is not None:
+                    # PLY texturizado: x,y,z (f4) + r,g,b (u1) con R=G=B=intensidad (efecto metal).
+                    dt = _np.dtype([('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
+                                    ('r', 'u1'), ('g', 'u1'), ('b', 'u1')])
+                    out = _np.empty(arr.shape[0], dt)
+                    out['x'], out['y'], out['z'] = arr[:, 0], arr[:, 1], arr[:, 2]
+                    out['r'] = out['g'] = out['b'] = inten
+                    body = out.tobytes()
+                    textured = True
+                else:
+                    body = arr.tobytes()
                 n_points = int(arr.shape[0])
             except Exception:
-                pass
+                # sin numpy no se puede alinear/filtrar la intensidad -> se manda solo XYZ
+                inten_bytes = b''
 
-            header = f"ply\nformat binary_little_endian 1.0\nelement vertex {n_points}\nproperty float x\nproperty float y\nproperty float z\nend_header\n"
+            if textured:
+                header = (f"ply\nformat binary_little_endian 1.0\nelement vertex {n_points}\n"
+                          f"property float x\nproperty float y\nproperty float z\n"
+                          f"property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n")
+            else:
+                header = (f"ply\nformat binary_little_endian 1.0\nelement vertex {n_points}\n"
+                          f"property float x\nproperty float y\nproperty float z\nend_header\n")
             ply_bytes = header.encode('ascii') + body
 
             # La nube se DEVUELVE siempre desde RAM (stream binario). Archivar a disco es
@@ -477,6 +515,7 @@ def handle_command(conn, cmd):
                 'uncompressed_size': len(ply_bytes),
                 'encoding': encoding,
                 'n_points': n_points,
+                'textured': textured,            # PLY con R=G=B=intensidad (efecto metal)
                 'frame_num': last_frame_num,
                 'n_frames': len(chunks),
                 'width': last_w,
